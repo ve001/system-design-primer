@@ -736,256 +736,63 @@ jobs:
           cloudflared --version
           echo "✅ cloudflared installed"
 
-      - name: Cleanup Existing Cloudflare Tunnel
-        if: steps.config.outputs.cloudflare_enabled == 'true'
-        run: |
-          echo "Checking for existing tunnel..."
-          TUNNEL_NAME="vnc-${{ steps.config.outputs.browser_profile_id }}"
-          echo "Tunnel name: $TUNNEL_NAME"
-
-          # List tunnels and find matching one
-          EXISTING_TUNNEL=$(curl -s --connect-timeout 10 --max-time 30 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel?name=${TUNNEL_NAME}" \
-            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" | jq -r '.result[0].id // empty')
-
-          if [ -n "$EXISTING_TUNNEL" ]; then
-            echo "Found existing tunnel: $EXISTING_TUNNEL"
-
-            # First, try to clean up tunnel connections
-            echo "Cleaning up tunnel connections..."
-            CLEANUP_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_TUNNEL}/connections" \
-              --request DELETE \
-              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
-            echo "Cleanup connections response: $CLEANUP_RESPONSE"
-
-            # Wait for connections to close
-            sleep 5
-
-            # Retry deletion with backoff
-            MAX_RETRIES=3
-            RETRY_COUNT=0
-            DELETE_SUCCESS=false
-
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DELETE_SUCCESS" != "true" ]; do
-              RETRY_COUNT=$((RETRY_COUNT + 1))
-              echo "Attempting to delete tunnel (attempt $RETRY_COUNT/$MAX_RETRIES)..."
-
-              DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_TUNNEL}" \
-                --request DELETE \
-                --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
-
-              DELETE_SUCCESS=$(echo "$DELETE_RESPONSE" | jq -r '.success // false')
-
-              if [ "$DELETE_SUCCESS" = "true" ]; then
-                echo "✅ Old tunnel deleted successfully"
-              else
-                ERROR_MSG=$(echo "$DELETE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')
-                echo "⚠️ Delete attempt $RETRY_COUNT failed: $ERROR_MSG"
-                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                  WAIT_TIME=$((RETRY_COUNT * 2))
-                  echo "Waiting ${WAIT_TIME} seconds before retry..."
-                  sleep $WAIT_TIME
-                fi
-              fi
-            done
-
-            if [ "$DELETE_SUCCESS" != "true" ]; then
-              echo "⚠️ Could not delete existing tunnel after $MAX_RETRIES attempts. Will try to create a new tunnel anyway."
-            fi
-          else
-            echo "No existing tunnel found"
-          fi
-
-      - name: Create Cloudflare Tunnel
+      - name: Bootstrap Cloudflare Tunnel (backend, reuse-don't-recreate)
         if: steps.config.outputs.cloudflare_enabled == 'true'
         id: tunnel
         run: |
-          echo "Creating Cloudflare Tunnel..."
-          TUNNEL_NAME="vnc-${{ steps.config.outputs.browser_profile_id }}"
-          echo "Tunnel name: $TUNNEL_NAME"
+          # Single backend call replaces the old 4-step CF dance
+          # (cleanup-existing -> create -> configure -> dns). The backend
+          # is cache-first and idempotent: it NEVER deletes the tunnel
+          # during start, so we can no longer hit error 1013 under load.
+          # If the tunnel already exists, we get back its id + a fresh
+          # cloudflared token. If it doesn't, the backend creates it.
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          USER_ID="${{ steps.config.outputs.user_id }}"
+          WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
 
-          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel" \
-            --request POST \
-            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
-            --header "Content-Type: application/json" \
-            --data "{
-              \"name\": \"${TUNNEL_NAME}\",
-              \"config_src\": \"cloudflare\"
-            }")
+          echo "Requesting tunnel bootstrap for profile ${BROWSER_PROFILE_ID}..."
 
-          # Check if tunnel creation was successful
-          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
-          if [ "$SUCCESS" != "true" ]; then
-            echo "⚠️ Tunnel creation failed, checking if tunnel already exists..."
-            echo "$RESPONSE" | jq '.'
-
-            # If create failed (usually duplicate name), try to reuse the existing tunnel
-            EXISTING=$(curl -s --connect-timeout 10 --max-time 30 \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel?name=${TUNNEL_NAME}&is_deleted=false" \
-              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
-
-            EXISTING_ID=$(echo "$EXISTING" | jq -r '.result[0].id // empty')
-            if [ -n "$EXISTING_ID" ]; then
-              echo "✅ Reusing existing tunnel: $EXISTING_ID"
-
-              # Clean up old connections so cloudflared can reconnect
-              curl -s --connect-timeout 10 --max-time 30 \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_ID}/connections" \
-                --request DELETE \
-                --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" || true
-              sleep 2
-
-              # Get a fresh token for the existing tunnel
-              TOKEN_RESP=$(curl -s --connect-timeout 10 --max-time 30 \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_ID}/token" \
-                --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
-              EXISTING_TOKEN=$(echo "$TOKEN_RESP" | jq -r '.result // empty')
-
-              if [ -n "$EXISTING_TOKEN" ] && [ "$EXISTING_TOKEN" != "null" ]; then
-                RESPONSE="$EXISTING"
-                SUCCESS="true"
-              else
-                echo "❌ Failed to get token for existing tunnel"
-                echo "$TOKEN_RESP" | jq '.'
-                exit 1
-              fi
-            else
-              echo "❌ Failed to create tunnel and no existing tunnel found"
-              exit 1
+          # Retry up to 3 times with linear backoff (1s, 2s, 4s) in case
+          # the backend or its CF dependency has a transient hiccup. This
+          # is the ONLY retry loop we need — no more 14s delete dance.
+          ATTEMPT=0
+          MAX_ATTEMPTS=3
+          BOOTSTRAP_RESPONSE=""
+          BOOTSTRAP_SUCCESS="false"
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            BOOTSTRAP_RESPONSE=$(curl -s --connect-timeout 10 --max-time 60 \
+              "http://159.203.158.168/ai-management-service/api/v1/browser-profile/${BROWSER_PROFILE_ID}/cloudflare-bootstrap" \
+              -H "user-id: ${USER_ID}" \
+              -H "workspace-id: ${WORKSPACE_ID}")
+            BOOTSTRAP_SUCCESS=$(echo "$BOOTSTRAP_RESPONSE" | jq -r '.success // false')
+            if [ "$BOOTSTRAP_SUCCESS" = "true" ]; then
+              break
             fi
-          fi
+            echo "⚠️ Bootstrap attempt ${ATTEMPT}/${MAX_ATTEMPTS} failed:"
+            echo "$BOOTSTRAP_RESPONSE" | jq '.' 2>/dev/null || echo "$BOOTSTRAP_RESPONSE"
+            sleep $((ATTEMPT * 2))
+          done
 
-          if [ "$SUCCESS" = "true" ]; then
-            # Try from create response first, fall back to existing tunnel lookup
-            TUNNEL_ID=$(echo "$RESPONSE" | jq -r '.result.id // .result[0].id // empty')
-            TUNNEL_TOKEN=$(echo "$RESPONSE" | jq -r '.result.token // empty')
-            # If token came from the /token endpoint (existing tunnel reuse)
-            if [ -z "$TUNNEL_TOKEN" ] || [ "$TUNNEL_TOKEN" = "null" ]; then
-              TUNNEL_TOKEN="${EXISTING_TOKEN:-}"
-            fi
-          fi
-          
-          if [ -z "$TUNNEL_ID" ] || [ "$TUNNEL_ID" = "null" ]; then
-            echo "❌ Failed to extract tunnel ID"
+          if [ "$BOOTSTRAP_SUCCESS" != "true" ]; then
+            echo "❌ Cloudflare bootstrap failed after ${MAX_ATTEMPTS} attempts"
             exit 1
           fi
-          
+
+          TUNNEL_ID=$(echo "$BOOTSTRAP_RESPONSE" | jq -r '.data.tunnel_id // empty')
+          TUNNEL_TOKEN=$(echo "$BOOTSTRAP_RESPONSE" | jq -r '.data.tunnel_token // empty')
+          HOSTNAME=$(echo "$BOOTSTRAP_RESPONSE" | jq -r '.data.hostname // empty')
+
+          if [ -z "$TUNNEL_ID" ] || [ -z "$TUNNEL_TOKEN" ] || [ -z "$HOSTNAME" ]; then
+            echo "❌ Bootstrap response missing required fields"
+            echo "$BOOTSTRAP_RESPONSE" | jq '.'
+            exit 1
+          fi
+
           echo "tunnel_id=$TUNNEL_ID" >> $GITHUB_OUTPUT
           echo "tunnel_token=$TUNNEL_TOKEN" >> $GITHUB_OUTPUT
-          echo "✅ Tunnel created: $TUNNEL_ID"
-
-      - name: Configure Tunnel
-        if: steps.config.outputs.cloudflare_enabled == 'true'
-        run: |
-          echo "Configuring tunnel for noVNC..."
-          
-          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${{ steps.tunnel.outputs.tunnel_id }}/configurations" \
-            --request PUT \
-            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
-            --header "Content-Type: application/json" \
-            --data "{
-              \"config\": {
-                \"ingress\": [
-                  {
-                    \"hostname\": \"${{ steps.config.outputs.hostname }}\",
-                    \"path\": \"/(workflow|terminal|status|transcribe|profile|chrome|server-logs|\\\\d+).*\",
-                    \"service\": \"http://localhost:8766\",
-                    \"originRequest\": {}
-                  },
-                  {
-                    \"hostname\": \"${{ steps.config.outputs.hostname }}\",
-                    \"service\": \"http://localhost:${NOVNC_PORT}\",
-                    \"originRequest\": {}
-                  },
-                  {
-                    \"service\": \"http_status:404\"
-                  }
-                ]
-              }
-            }")
-          
-          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
-          if [ "$SUCCESS" != "true" ]; then
-            echo "❌ Failed to configure tunnel"
-            echo "$RESPONSE" | jq '.'
-            exit 1
-          fi
-          
-          echo "✅ Tunnel configured"
-
-      - name: Create DNS Record
-        if: steps.config.outputs.cloudflare_enabled == 'true'
-        run: |
-          echo "Creating DNS record..."
-          
-          FULL_HOSTNAME="${{ steps.config.outputs.hostname }}"
-          echo "Hostname: $FULL_HOSTNAME"
-          echo "Tunnel ID: ${{ steps.tunnel.outputs.tunnel_id }}"
-          echo "Target: ${{ steps.tunnel.outputs.tunnel_id }}.cfargotunnel.com"
-          
-          # Check for existing DNS record
-          EXISTING_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records?name=${FULL_HOSTNAME}" \
-            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
-          
-          echo "Existing DNS check response:"
-          echo "$EXISTING_RESPONSE" | jq '.'
-          
-          EXISTING=$(echo "$EXISTING_RESPONSE" | jq -r '.result[0].id // empty')
-          
-          if [ -n "$EXISTING" ]; then
-            echo "⚠️ DNS record already exists (ID: $EXISTING), deleting..."
-            DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records/${EXISTING}" \
-              --request DELETE \
-              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
-            echo "Delete response:"
-            echo "$DELETE_RESPONSE" | jq '.'
-            sleep 2
-          fi
-
-          # Create new DNS record
-          echo "Creating new DNS record..."
-          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records" \
-            --request POST \
-            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
-            --header "Content-Type: application/json" \
-            --data "{
-              \"type\": \"CNAME\",
-              \"proxied\": true,
-              \"name\": \"${FULL_HOSTNAME}\",
-              \"content\": \"${{ steps.tunnel.outputs.tunnel_id }}.cfargotunnel.com\"
-            }")
-          
-          echo "Create DNS response:"
-          echo "$RESPONSE" | jq '.'
-          
-          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
-          if [ "$SUCCESS" != "true" ]; then
-            echo "❌ Failed to create DNS record"
-            echo "Error details:"
-            echo "$RESPONSE" | jq '.errors'
-            exit 1
-          fi
-          
-          DNS_RECORD_ID=$(echo "$RESPONSE" | jq -r '.result.id')
-          echo "✅ DNS record created successfully (ID: $DNS_RECORD_ID)"
+          echo "hostname=$HOSTNAME" >> $GITHUB_OUTPUT
+          echo "✅ Tunnel ready: $TUNNEL_ID (hostname=$HOSTNAME)"
 
       - name: Start Cloudflare Tunnel
         if: steps.config.outputs.cloudflare_enabled == 'true'
@@ -1248,54 +1055,21 @@ jobs:
             fi
           fi
 
-          # Delete DNS record
-          if [ -n "$FULL_HOSTNAME" ] && [ "$FULL_HOSTNAME" != "null" ]; then
-            echo "Deleting DNS record for ${FULL_HOSTNAME}..."
-            EXISTING_DNS=$(curl -s --connect-timeout 10 --max-time 30 \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records?name=${FULL_HOSTNAME}" \
-              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" | jq -r '.result[0].id // empty')
+          # Delete DNS record — SKIPPED under reuse-don't-recreate.
+          # The DNS CNAME stays so the next start can immediately reuse the
+          # tunnel without a second DNS-propagation wait. Hard teardown
+          # happens only on profile delete (via backend) or via the
+          # cloudflare_tunnel_reconciler_service for orphans.
+          echo "ℹ️ DNS record kept alive (reuse-don't-recreate)"
 
-            if [ -n "$EXISTING_DNS" ]; then
-              DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records/${EXISTING_DNS}" \
-                --request DELETE \
-                --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+          # Delete Cloudflare tunnel — SKIPPED under reuse-don't-recreate.
+          # See above. Tunnels are long-lived per profile; they are reaped
+          # by cloudflare_tunnel_reconciler_service when the profile row is
+          # gone, and by browser_profile_service.delete() on explicit
+          # profile deletion.
+          echo "ℹ️ Cloudflare tunnel ${{ steps.tunnel.outputs.tunnel_id }} kept alive for reuse"
 
-              DELETE_SUCCESS=$(echo "$DELETE_RESPONSE" | jq -r '.success // false')
-              if [ "$DELETE_SUCCESS" = "true" ]; then
-                echo "✅ DNS record deleted successfully"
-              else
-                echo "⚠️ Failed to delete DNS record"
-                echo "$DELETE_RESPONSE" | jq '.'
-              fi
-            else
-              echo "⚠️ DNS record not found"
-            fi
-          fi
-
-          # Delete Cloudflare tunnel
-          if [ -n "${{ steps.tunnel.outputs.tunnel_id }}" ] && [ "${{ steps.tunnel.outputs.tunnel_id }}" != "null" ]; then
-            echo "Deleting Cloudflare tunnel ${{ steps.tunnel.outputs.tunnel_id }}..."
-            TUNNEL_DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${{ steps.tunnel.outputs.tunnel_id }}" \
-              --request DELETE \
-              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
-
-            TUNNEL_DELETE_SUCCESS=$(echo "$TUNNEL_DELETE_RESPONSE" | jq -r '.success // false')
-            if [ "$TUNNEL_DELETE_SUCCESS" = "true" ]; then
-              echo "✅ Cloudflare tunnel deleted successfully"
-            else
-              echo "⚠️ Failed to delete Cloudflare tunnel"
-              echo "$TUNNEL_DELETE_RESPONSE" | jq '.'
-            fi
-          else
-            echo "⚠️ Tunnel ID not found"
-          fi
-
-          echo "✅ Cloudflare cleanup complete"
+          echo "✅ Cloudflare cleanup complete (tunnel kept for reuse)"
           exit 0
 
       - name: Cleanup Webshare IP Authorization
